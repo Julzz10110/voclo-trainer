@@ -1,0 +1,70 @@
+# Default configuration for voice conversion training
+
+model:
+  # Model architecture: "rvc", "sovits", "vits"
+  name: "rvc"
+  
+  # Audio parameters (must match voclo expectations)
+  sample_rate: 44100
+  hop_length: 512
+  n_fft: 2048
+  n_mels: 80
+  win_length: 2048
+  
+  # Model architecture parameters
+  hidden_size: 256
+  num_layers: 3
+  kernel_size: 5
+  dropout: 0.1
+  
+  # RVC-specific parameters
+  f0_bin: 256
+  f0_min: 50.0
+  f0_max: 1100.0
+  embed_dim: 256
+
+training:
+  batch_size: 16
+  num_epochs: 100
+  learning_rate: 0.0001
+  weight_decay: 0.0001
+  save_interval: 10
+  validation_interval: 5
+  gradient_clip: 1.0
+  
+  # Loss weights
+  loss_weights:
+    mel: 1.0
+    recon: 1.0
+    kl: 0.1
+    f0: 0.5
+
+data:
+  train_dir: "data/train"
+  val_dir: "data/val"
+  segment_length: 8192  # ~186ms at 44.1kHz
+  num_workers: 4
+  pin_memory: true
+  
+  # Data augmentation
+  augmentation:
+    enabled: true
+    pitch_shift_range: [-2, 2]  # semitones
+    time_stretch_range: [0.9, 1.1]
+    noise_level: 0.01
+
+export:
+  # ONNX export settings
+  opset_version: 14
+  dynamic_axes:
+    input: [0, 1]  # batch, time
+    output: [0, 1]
+  
+  # Model naming
+  name_template: "{name}_sr{sample_rate}_hop{hop_length}_nfft{n_fft}"
+
+logging:
+  log_dir: "logs"
+  tensorboard: true
+  console_log_interval: 100
+
