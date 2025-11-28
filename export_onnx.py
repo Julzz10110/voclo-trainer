@@ -8,7 +8,7 @@ from pathlib import Path
 import logging
 import onnx
 
-# Опциональный импорт onnxsim (нужен только для упрощения модели)
+# Optional onnxsim import (only needed to simplify the model)
 try:
     import onnxsim
     ONNXSIM_AVAILABLE = True
@@ -86,37 +86,47 @@ def export_to_onnx(
     """
     logger.info("Exporting model to ONNX...")
     
-    # Create dummy input
-    # For voclo, we expect audio input [batch, time]
+    # Get n_mels from model
+    n_mels = getattr(model, 'n_mels', 80)  # Default to 80 if not found
+    
+    # Create dummy input - mel spectrogram format
+    # Model expects mel spectrogram [batch, n_mels, time_frames]
     # Using a typical buffer size (~100ms at 44.1kHz = 4410 samples)
+    # With hop_length=512, this gives ~8-9 time frames
     dummy_audio_length = 4410
-    dummy_audio = torch.randn(1, dummy_audio_length)
+    time_frames = (dummy_audio_length // hop_length) + 1
+    dummy_mel = torch.randn(1, n_mels, time_frames)
     
     # Create wrapper function for ONNX export
-    # The model should take audio and optionally speaker_id
-    def model_forward(audio: torch.Tensor, speaker_id: torch.Tensor = None):
+    # The model should take mel spectrogram and optionally speaker_id
+    def model_forward(mel: torch.Tensor, speaker_id: torch.Tensor = None):
         """Wrapper for ONNX export."""
         if speaker_id is None:
-            speaker_id = torch.zeros(audio.size(0), dtype=torch.long)
-        return model.forward_audio(audio, speaker_id)
+            speaker_id = torch.zeros(mel.size(0), dtype=torch.long)
+        # Use forward method directly with mel input
+        output = model.forward(mel, speaker_id, None)
+        return output["mel"]
     
     # Export
-    logger.info(f"Exporting with input shape: {dummy_audio.shape}")
+    logger.info(f"Exporting with input shape: {dummy_mel.shape} (mel spectrogram)")
     
     try:
+        # Use the old export method (dynamo=False) for compatibility
+        # The new torch.export may have issues with some models
         torch.onnx.export(
             model,
-            (dummy_audio,),
+            (dummy_mel,),
             output_path,
-            input_names=['audio'],
+            input_names=['mel'],
             output_names=['output'],
             dynamic_axes={
-                'audio': {0: 'batch', 1: 'time'},
-                'output': {0: 'batch', 1: 'time'}
+                'mel': {0: 'batch', 2: 'time'},
+                'output': {0: 'batch', 2: 'time'}
             },
             opset_version=opset_version,
             do_constant_folding=True,
-            verbose=False
+            verbose=False,
+            dynamo=False  # Используем старый метод экспорта
         )
         logger.info(f"ONNX model exported to {output_path}")
     except Exception as e:
