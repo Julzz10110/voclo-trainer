@@ -7,7 +7,13 @@ import yaml
 from pathlib import Path
 import logging
 import onnx
-import onnxsim
+
+# Опциональный импорт onnxsim (нужен только для упрощения модели)
+try:
+    import onnxsim
+    ONNXSIM_AVAILABLE = True
+except ImportError:
+    ONNXSIM_AVAILABLE = False
 
 from models.rvc import RVCModel
 
@@ -119,17 +125,21 @@ def export_to_onnx(
     
     # Simplify model if requested
     if simplify:
-        try:
-            logger.info("Simplifying ONNX model...")
-            onnx_model = onnx.load(output_path)
-            simplified_model, check = onnxsim.simplify(onnx_model)
-            if check:
-                onnx.save(simplified_model, output_path)
-                logger.info("ONNX model simplified successfully")
-            else:
-                logger.warning("ONNX model simplification check failed, using original")
-        except Exception as e:
-            logger.warning(f"Failed to simplify ONNX model: {e}")
+        if not ONNXSIM_AVAILABLE:
+            logger.warning("onnxsim не установлен. Пропускаем упрощение модели.")
+            logger.info("Модель экспортирована без упрощения. Это нормально, модель будет работать.")
+        else:
+            try:
+                logger.info("Simplifying ONNX model...")
+                onnx_model = onnx.load(output_path)
+                simplified_model, check = onnxsim.simplify(onnx_model)
+                if check:
+                    onnx.save(simplified_model, output_path)
+                    logger.info("ONNX model simplified successfully")
+                else:
+                    logger.warning("ONNX model simplification check failed, using original")
+            except Exception as e:
+                logger.warning(f"Failed to simplify ONNX model: {e}")
     
     # Verify ONNX model
     try:
@@ -260,4 +270,7 @@ def main():
 
 if __name__ == '__main__':
     main()
+
+
+
 
