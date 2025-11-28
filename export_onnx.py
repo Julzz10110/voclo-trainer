@@ -56,8 +56,26 @@ def load_model_from_checkpoint(
     else:
         raise ValueError(f"Unknown model type: {model_config['name']}")
     
-    # Load weights
-    model.load_state_dict(checkpoint['model_state_dict'])
+    # Load weights - allow missing keys for backward compatibility
+    # (e.g., audio_to_mel layer added in newer versions)
+    state_dict = checkpoint['model_state_dict']
+    model_state = model.state_dict()
+    
+    # Filter out keys that don't exist in the model
+    filtered_state_dict = {k: v for k, v in state_dict.items() if k in model_state}
+    missing_keys = set(model_state.keys()) - set(state_dict.keys())
+    unexpected_keys = set(state_dict.keys()) - set(model_state.keys())
+    
+    if missing_keys:
+        logger.warning(f"Missing keys in checkpoint (will use default initialization): {missing_keys}")
+    if unexpected_keys:
+        logger.warning(f"Unexpected keys in checkpoint (will be ignored): {unexpected_keys}")
+    
+    # Load available weights
+    model.load_state_dict(filtered_state_dict, strict=False)
+    
+    # If audio_to_mel is missing, it will be initialized with default weights from __init__
+    # This is fine for ONNX export as the layer is used for audio-to-mel conversion
     model.eval()
     
     logger.info("Model loaded successfully")
