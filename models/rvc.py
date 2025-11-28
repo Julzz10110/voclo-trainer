@@ -291,10 +291,12 @@ class RVCModel(BaseVoiceConversionModel):
         # Compute STFT - process first sample (ONNX doesn't handle loops well)
         # For batch processing, we'll handle one at a time or use batch STFT if available
         # For ONNX compatibility, we process batch_size=1 case
-        # ONNX doesn't support complex types, so we use return_complex=True
-        # and convert to real representation using view_as_real
+        # ONNX doesn't support complex types, so we use return_complex=False
+        # which returns [..., 2] tensor directly (real, imag) without complex type
         if batch_size == 1:
-            stft = torch.stft(
+            # Use return_complex=False to avoid complex types in ONNX export
+            # Returns [n_fft//2 + 1, time_frames, 2] where last dim is [real, imag]
+            stft_real = torch.stft(
                 audio.squeeze(0),
                 n_fft=self.n_fft,
                 hop_length=self.hop_length,
@@ -303,11 +305,8 @@ class RVCModel(BaseVoiceConversionModel):
                 center=True,
                 normalized=False,
                 onesided=True,
-                return_complex=True
-            )
-            # Convert complex to real representation for ONNX compatibility
-            # view_as_real converts [..., complex] to [..., 2] where last dim is [real, imag]
-            stft_real = torch.view_as_real(stft)  # [n_fft//2 + 1, time_frames, 2]
+                return_complex=False  # Returns [..., 2] directly, no complex type
+            )  # [n_fft//2 + 1, time_frames, 2]
             # Compute magnitude: sqrt(real^2 + imag^2)
             real_part = stft_real[..., 0]  # [n_fft//2 + 1, time_frames]
             imag_part = stft_real[..., 1]  # [n_fft//2 + 1, time_frames]
@@ -317,7 +316,8 @@ class RVCModel(BaseVoiceConversionModel):
             # In practice, voclo processes one sample at a time
             stft_results = []
             for i in range(batch_size):
-                stft = torch.stft(
+                # Use return_complex=False to avoid complex types in ONNX export
+                stft_real = torch.stft(
                     audio[i],
                     n_fft=self.n_fft,
                     hop_length=self.hop_length,
@@ -326,10 +326,9 @@ class RVCModel(BaseVoiceConversionModel):
                     center=True,
                     normalized=False,
                     onesided=True,
-                    return_complex=True
-                )
-                # Convert complex to real representation for ONNX compatibility
-                stft_real = torch.view_as_real(stft)
+                    return_complex=False  # Returns [..., 2] directly, no complex type
+                )  # [n_fft//2 + 1, time_frames, 2]
+                # Compute magnitude: sqrt(real^2 + imag^2)
                 real_part = stft_real[..., 0]
                 imag_part = stft_real[..., 1]
                 magnitude = torch.sqrt(real_part ** 2 + imag_part ** 2)
