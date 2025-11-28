@@ -291,9 +291,9 @@ class RVCModel(BaseVoiceConversionModel):
         # Compute STFT - process first sample (ONNX doesn't handle loops well)
         # For batch processing, we'll handle one at a time or use batch STFT if available
         # For ONNX compatibility, we process batch_size=1 case
-        # Use return_complex=False for better ONNX compatibility
+        # Use return_complex=True and convert to magnitude using torch.abs
         if batch_size == 1:
-            stft_real, stft_imag = torch.stft(
+            stft = torch.stft(
                 audio.squeeze(0),
                 n_fft=self.n_fft,
                 hop_length=self.hop_length,
@@ -302,16 +302,17 @@ class RVCModel(BaseVoiceConversionModel):
                 center=True,
                 normalized=False,
                 onesided=True,
-                return_complex=False
+                return_complex=True
             )
-            # Convert to magnitude: [n_fft//2 + 1, time_frames]
-            magnitude = torch.sqrt(stft_real ** 2 + stft_imag ** 2).unsqueeze(0)  # [1, n_fft//2 + 1, time_frames]
+            # Convert complex to magnitude: [n_fft//2 + 1, time_frames]
+            # torch.abs works with complex tensors and is ONNX-compatible
+            magnitude = torch.abs(stft).unsqueeze(0)  # [1, n_fft//2 + 1, time_frames]
         else:
             # For batch > 1, process each item (may not export well to ONNX)
             # In practice, voclo processes one sample at a time
             stft_results = []
             for i in range(batch_size):
-                stft_real, stft_imag = torch.stft(
+                stft = torch.stft(
                     audio[i],
                     n_fft=self.n_fft,
                     hop_length=self.hop_length,
@@ -320,9 +321,9 @@ class RVCModel(BaseVoiceConversionModel):
                     center=True,
                     normalized=False,
                     onesided=True,
-                    return_complex=False
+                    return_complex=True
                 )
-                magnitude = torch.sqrt(stft_real ** 2 + stft_imag ** 2)
+                magnitude = torch.abs(stft)
                 stft_results.append(magnitude)
             magnitude = torch.stack(stft_results, dim=0)  # [batch, n_fft//2 + 1, time_frames]
         
