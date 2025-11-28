@@ -187,14 +187,29 @@ class RVCModel(BaseVoiceConversionModel):
                 - mel: Reconstructed mel spectrogram
                 - encoded: Encoded features
         """
-        # For training, we expect mel spectrogram as input
-        # If audio is provided, we need to compute mel first
-        # For simplicity, assume input is already mel [batch, n_mels, time]
-        if audio.dim() == 2:
-            # Assume it's mel spectrogram
-            mel = audio.unsqueeze(1) if audio.size(1) == self.n_mels else audio
-        else:
+        # For training, we expect mel spectrogram as input [batch, n_mels, time]
+        # When called from forward_audio, mel is already in correct format [batch, n_mels, time_frames]
+        # When called during training, audio might be mel [batch, n_mels, time] or raw audio [batch, time]
+        if audio.dim() == 3:
+            # Already in correct format [batch, n_mels, time]
             mel = audio
+        elif audio.dim() == 2:
+            # Could be mel [batch, n_mels] or raw audio [batch, time]
+            # Check if second dimension matches n_mels
+            if audio.size(1) == self.n_mels:
+                # This is mel in wrong format [batch, n_mels] - need to add time dimension
+                # This shouldn't happen in normal flow, but handle it
+                mel = audio.unsqueeze(-1)  # [batch, n_mels, 1]
+            else:
+                # This is raw audio [batch, time] - should not happen in forward
+                # This means forward was called incorrectly
+                raise ValueError(
+                    f"forward() received raw audio [batch={audio.size(0)}, time={audio.size(1)}], "
+                    f"but expects mel spectrogram [batch, n_mels={self.n_mels}, time]. "
+                    f"Use forward_audio() for raw audio input."
+                )
+        else:
+            raise ValueError(f"Unexpected input dimension: {audio.dim()}, expected 2 or 3")
         
         # Encode
         encoded = self.encoder(mel)
@@ -276,8 +291,9 @@ class RVCModel(BaseVoiceConversionModel):
         # Compute STFT - process first sample (ONNX doesn't handle loops well)
         # For batch processing, we'll handle one at a time or use batch STFT if available
         # For ONNX compatibility, we process batch_size=1 case
+        # Use return_complex=False for better ONNX compatibility
         if batch_size == 1:
-            stft = torch.stft(
+            stft_real, stft_imag = torch.stft(
                 audio.squeeze(0),
                 n_fft=self.n_fft,
                 hop_length=self.hop_length,
@@ -286,16 +302,16 @@ class RVCModel(BaseVoiceConversionModel):
                 center=True,
                 normalized=False,
                 onesided=True,
-                return_complex=True
+                return_complex=False
             )
             # Convert to magnitude: [n_fft//2 + 1, time_frames]
-            magnitude = torch.abs(stft).unsqueeze(0)  # [1, n_fft//2 + 1, time_frames]
+            magnitude = torch.sqrt(stft_real ** 2 + stft_imag ** 2).unsqueeze(0)  # [1, n_fft//2 + 1, time_frames]
         else:
             # For batch > 1, process each item (may not export well to ONNX)
             # In practice, voclo processes one sample at a time
             stft_results = []
             for i in range(batch_size):
-                stft = torch.stft(
+                stft_real, stft_imag = torch.stft(
                     audio[i],
                     n_fft=self.n_fft,
                     hop_length=self.hop_length,
@@ -304,9 +320,9 @@ class RVCModel(BaseVoiceConversionModel):
                     center=True,
                     normalized=False,
                     onesided=True,
-                    return_complex=True
+                    return_complex=False
                 )
-                magnitude = torch.abs(stft)
+                magnitude = torch.sqrt(stft_real ** 2 + stft_imag ** 2)
                 stft_results.append(magnitude)
             magnitude = torch.stack(stft_results, dim=0)  # [batch, n_fft//2 + 1, time_frames]
         
