@@ -2,6 +2,7 @@
 
 import argparse
 import torch
+import torch.nn
 import torch.onnx
 import yaml
 from pathlib import Path
@@ -110,14 +111,21 @@ def export_to_onnx(
     dummy_audio_length = 4410
     dummy_audio = torch.randn(1, dummy_audio_length)
     
-    # Create wrapper function for ONNX export
-    # The model should take raw audio and optionally speaker_id
-    def model_forward(audio: torch.Tensor, speaker_id: torch.Tensor = None):
-        """Wrapper for ONNX export."""
-        if speaker_id is None:
-            speaker_id = torch.zeros(audio.size(0), dtype=torch.long)
-        # Use forward_audio method which handles audio -> mel conversion
-        return model.forward_audio(audio, speaker_id)
+    # Create wrapper class for ONNX export
+    # ONNX export needs a module, not just a function
+    class ModelWrapper(torch.nn.Module):
+        """Wrapper module that uses forward_audio for ONNX export."""
+        def __init__(self, base_model):
+            super().__init__()
+            self.base_model = base_model
+        
+        def forward(self, audio: torch.Tensor):
+            """Forward pass using forward_audio method."""
+            return self.base_model.forward_audio(audio, None)
+    
+    # Create wrapped model
+    wrapped_model = ModelWrapper(model)
+    wrapped_model.eval()
     
     # Export
     logger.info(f"Exporting with input shape: {dummy_audio.shape} (raw audio)")
@@ -126,7 +134,7 @@ def export_to_onnx(
         # Use the old export method (dynamo=False) for compatibility
         # The new torch.export may have issues with some models
         torch.onnx.export(
-            model,
+            wrapped_model,
             (dummy_audio,),
             output_path,
             input_names=['audio'],
