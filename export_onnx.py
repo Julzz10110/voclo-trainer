@@ -89,7 +89,7 @@ def export_to_onnx(
     sample_rate: int = 44100,
     hop_length: int = 512,
     n_fft: int = 2048,
-    opset_version: int = 14,
+    opset_version: int = 17,  # Minimum version for STFT support
     simplify: bool = True
 ):
     """Export model to ONNX format.
@@ -235,8 +235,8 @@ def main():
     parser.add_argument(
         '--opset-version',
         type=int,
-        default=14,
-        help='ONNX opset version'
+        default=17,  # Minimum version for STFT support
+        help='ONNX opset version (minimum 17 for STFT support)'
     )
     parser.add_argument(
         '--no-simplify',
