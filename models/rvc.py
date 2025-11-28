@@ -153,6 +153,21 @@ class RVCModel(BaseVoiceConversionModel):
         
         # F0 processing
         self.f0_embedding = nn.Linear(1, hidden_size)
+        
+        # Audio to mel conversion for ONNX export
+        # Create mel projection layer (simplified mel filter bank)
+        n_freq_bins = n_fft // 2 + 1
+        self.audio_to_mel = nn.Linear(n_freq_bins, n_mels, bias=False)
+        # Initialize with simple averaging projection
+        with torch.no_grad():
+            weight = torch.zeros(n_mels, n_freq_bins)
+            bins_per_mel = n_freq_bins / n_mels
+            for i in range(n_mels):
+                start = int(i * bins_per_mel)
+                end = int((i + 1) * bins_per_mel)
+                if end > start:
+                    weight[i, start:end] = 1.0 / (end - start)
+            self.audio_to_mel.weight.copy_(weight)
     
     def forward(
         self,
@@ -238,42 +253,77 @@ class RVCModel(BaseVoiceConversionModel):
         """Forward pass with raw audio input.
         
         This is the interface expected by ONNX export.
-        For voclo compatibility, this should output audio directly.
-        
-        Note: This is a simplified version. In production, you would:
-        1. Convert audio to mel spectrogram
-        2. Process through encoder/decoder
-        3. Convert mel back to audio using a vocoder
-        
-        For now, we process mel and return it (voclo will handle conversion).
+        Converts audio to mel spectrogram, processes it, and returns converted mel.
         
         Args:
-            audio: Input audio [batch, time]
+            audio: Input audio [batch, time] - raw audio samples
             speaker_id: Speaker ID [batch] (optional, defaults to 0)
             
         Returns:
-            Converted mel spectrogram [batch, n_mels, time]
-            (In full implementation, this would be converted back to audio)
+            Converted mel spectrogram [batch, n_mels, time_frames]
         """
         if speaker_id is None:
             speaker_id = torch.zeros(audio.size(0), dtype=torch.long, device=audio.device)
         
-        # Convert audio to mel spectrogram
-        # For ONNX export, we'll need to handle this differently
-        # For now, assume input is already in mel format or use a simple conversion
-        # In practice, you'd use librosa or torchaudio for proper conversion
+        # Convert audio to mel spectrogram using torch STFT
+        # This is ONNX-compatible
+        batch_size = audio.size(0)
         
-        # Simplified: if audio is 2D and has n_mels channels, treat as mel
-        if audio.dim() == 2 and audio.size(1) == self.n_mels:
-            mel = audio
-        else:
-            # For ONNX, we'll need to handle audio-to-mel conversion
-            # This is a placeholder - in production use proper STFT
-            # For now, we'll assume the model receives mel directly
-            raise NotImplementedError(
-                "Audio-to-mel conversion not implemented for ONNX export. "
-                "Please provide mel spectrogram input or implement vocoder."
+        # Ensure audio is 2D [batch, time]
+        if audio.dim() == 1:
+            audio = audio.unsqueeze(0)
+        
+        # Compute STFT - process first sample (ONNX doesn't handle loops well)
+        # For batch processing, we'll handle one at a time or use batch STFT if available
+        # For ONNX compatibility, we process batch_size=1 case
+        if batch_size == 1:
+            stft = torch.stft(
+                audio.squeeze(0),
+                n_fft=self.n_fft,
+                hop_length=self.hop_length,
+                win_length=self.n_fft,
+                window=torch.hann_window(self.n_fft, device=audio.device),
+                center=True,
+                normalized=False,
+                onesided=True,
+                return_complex=True
             )
+            # Convert to magnitude: [n_fft//2 + 1, time_frames]
+            magnitude = torch.abs(stft).unsqueeze(0)  # [1, n_fft//2 + 1, time_frames]
+        else:
+            # For batch > 1, process each item (may not export well to ONNX)
+            # In practice, voclo processes one sample at a time
+            stft_results = []
+            for i in range(batch_size):
+                stft = torch.stft(
+                    audio[i],
+                    n_fft=self.n_fft,
+                    hop_length=self.hop_length,
+                    win_length=self.n_fft,
+                    window=torch.hann_window(self.n_fft, device=audio.device),
+                    center=True,
+                    normalized=False,
+                    onesided=True,
+                    return_complex=True
+                )
+                magnitude = torch.abs(stft)
+                stft_results.append(magnitude)
+            magnitude = torch.stack(stft_results, dim=0)  # [batch, n_fft//2 + 1, time_frames]
+        
+        # Reshape for linear layer: [batch, time_frames, n_fft//2 + 1]
+        magnitude = magnitude.transpose(1, 2)
+        
+        # Apply mel projection: [batch, time_frames, n_mels]
+        mel = self.audio_to_mel(magnitude)
+        
+        # Transpose back to [batch, n_mels, time_frames]
+        mel = mel.transpose(1, 2)
+        
+        # Log scale (add small epsilon to avoid log(0))
+        mel = torch.log(mel + 1e-10)
+        
+        # Normalize (optional, but helps with training stability)
+        mel = (mel - mel.mean(dim=-1, keepdim=True)) / (mel.std(dim=-1, keepdim=True) + 1e-10)
         
         # Process through model
         output = self.forward(mel, speaker_id, None)
