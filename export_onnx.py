@@ -141,7 +141,7 @@ def export_to_onnx(
             output_names=['output'],
             dynamic_axes={
                 'audio': {0: 'batch', 1: 'time'},
-                'output': {0: 'batch', 1: 'n_mels', 2: 'time'}
+                'output': {0: 'batch', 1: 'time'}  # Model now returns raw audio, not mel
             },
             opset_version=opset_version,
             do_constant_folding=True,

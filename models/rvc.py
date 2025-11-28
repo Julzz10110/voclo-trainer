@@ -168,6 +168,14 @@ class RVCModel(BaseVoiceConversionModel):
                 if end > start:
                     weight[i, start:end] = 1.0 / (end - start)
             self.audio_to_mel.weight.copy_(weight)
+        
+        # Mel to audio conversion (inverse mel projection)
+        # This is the inverse of audio_to_mel for converting mel back to magnitude
+        self.mel_to_audio = nn.Linear(n_mels, n_freq_bins, bias=False)
+        # Initialize as pseudo-inverse (transpose of audio_to_mel)
+        with torch.no_grad():
+            # Use transpose as approximate inverse for simple averaging projection
+            self.mel_to_audio.weight.copy_(self.audio_to_mel.weight.t())
     
     def forward(
         self,
@@ -268,14 +276,14 @@ class RVCModel(BaseVoiceConversionModel):
         """Forward pass with raw audio input.
         
         This is the interface expected by ONNX export.
-        Converts audio to mel spectrogram, processes it, and returns converted mel.
+        Converts audio to mel spectrogram, processes it, and returns converted raw audio.
         
         Args:
             audio: Input audio [batch, time] - raw audio samples
             speaker_id: Speaker ID [batch] (optional, defaults to 0)
             
         Returns:
-            Converted mel spectrogram [batch, n_mels, time_frames]
+            Converted raw audio [batch, time]
         """
         if speaker_id is None:
             speaker_id = torch.zeros(audio.size(0), dtype=torch.long, device=audio.device)
@@ -307,14 +315,19 @@ class RVCModel(BaseVoiceConversionModel):
                 onesided=True,
                 return_complex=False  # Returns [..., 2] directly, no complex type
             )  # [n_fft//2 + 1, time_frames, 2]
-            # Compute magnitude: sqrt(real^2 + imag^2)
+            # Save phase for ISTFT later
             real_part = stft_real[..., 0]  # [n_fft//2 + 1, time_frames]
             imag_part = stft_real[..., 1]  # [n_fft//2 + 1, time_frames]
-            magnitude = torch.sqrt(real_part ** 2 + imag_part ** 2).unsqueeze(0)  # [1, n_fft//2 + 1, time_frames]
+            magnitude = torch.sqrt(real_part ** 2 + imag_part ** 2)  # [n_fft//2 + 1, time_frames]
+            # Compute phase: atan2(imag, real)
+            phase = torch.atan2(imag_part, real_part)  # [n_fft//2 + 1, time_frames]
+            magnitude = magnitude.unsqueeze(0)  # [1, n_fft//2 + 1, time_frames]
+            phase = phase.unsqueeze(0)  # [1, n_fft//2 + 1, time_frames]
         else:
             # For batch > 1, process each item (may not export well to ONNX)
             # In practice, voclo processes one sample at a time
             stft_results = []
+            phase_results = []
             for i in range(batch_size):
                 # Use return_complex=False to avoid complex types in ONNX export
                 stft_real = torch.stft(
@@ -328,12 +341,15 @@ class RVCModel(BaseVoiceConversionModel):
                     onesided=True,
                     return_complex=False  # Returns [..., 2] directly, no complex type
                 )  # [n_fft//2 + 1, time_frames, 2]
-                # Compute magnitude: sqrt(real^2 + imag^2)
+                # Compute magnitude and phase
                 real_part = stft_real[..., 0]
                 imag_part = stft_real[..., 1]
                 magnitude = torch.sqrt(real_part ** 2 + imag_part ** 2)
+                phase = torch.atan2(imag_part, real_part)
                 stft_results.append(magnitude)
+                phase_results.append(phase)
             magnitude = torch.stack(stft_results, dim=0)  # [batch, n_fft//2 + 1, time_frames]
+            phase = torch.stack(phase_results, dim=0)  # [batch, n_fft//2 + 1, time_frames]
         
         # Reshape for linear layer: [batch, time_frames, n_fft//2 + 1]
         magnitude = magnitude.transpose(1, 2)
@@ -352,5 +368,72 @@ class RVCModel(BaseVoiceConversionModel):
         
         # Process through model
         output = self.forward(mel, speaker_id, None)
-        return output["mel"]
+        output_mel = output["mel"]  # [batch, n_mels, time_frames]
+        
+        # Convert mel back to magnitude
+        # Denormalize and inverse log
+        output_mel = output_mel * (output_mel.std(dim=-1, keepdim=True) + 1e-10) + output_mel.mean(dim=-1, keepdim=True)
+        output_mel = torch.exp(output_mel) - 1e-10
+        
+        # Reshape for linear layer: [batch, time_frames, n_mels]
+        output_mel = output_mel.transpose(1, 2)
+        
+        # Apply inverse mel projection: [batch, time_frames, n_fft//2 + 1]
+        output_magnitude = self.mel_to_audio(output_mel)
+        
+        # Transpose back to [batch, n_fft//2 + 1, time_frames]
+        output_magnitude = output_magnitude.transpose(1, 2)
+        
+        # Reconstruct STFT using original phase
+        # Convert magnitude and phase back to real/imag
+        output_real = output_magnitude * torch.cos(phase)  # [batch, n_fft//2 + 1, time_frames]
+        output_imag = output_magnitude * torch.sin(phase)  # [batch, n_fft//2 + 1, time_frames]
+        
+        # Stack real and imag: [batch, n_fft//2 + 1, time_frames, 2]
+        output_stft = torch.stack([output_real, output_imag], dim=-1)
+        
+        # Convert to complex format for ISTFT
+        # torch.istft expects complex tensor, but ONNX doesn't support complex
+        # So we need to use a workaround: create a view_as_complex tensor
+        # For ONNX compatibility, we'll use torch.view_as_complex
+        if batch_size == 1:
+            # Squeeze batch dimension for ISTFT
+            output_stft_squeezed = output_stft.squeeze(0)  # [n_fft//2 + 1, time_frames, 2]
+            # Convert to complex using view_as_complex
+            output_stft_complex = torch.view_as_complex(output_stft_squeezed)  # [n_fft//2 + 1, time_frames]
+            
+            # Inverse STFT to get raw audio
+            output_audio = torch.istft(
+                output_stft_complex,
+                n_fft=self.n_fft,
+                hop_length=self.hop_length,
+                win_length=self.n_fft,
+                window=torch.hann_window(self.n_fft, device=audio.device),
+                center=True,
+                normalized=False,
+                onesided=True
+            )  # [time]
+            
+            # Add batch dimension back
+            output_audio = output_audio.unsqueeze(0)  # [1, time]
+        else:
+            # For batch > 1, process each item
+            audio_results = []
+            for i in range(batch_size):
+                output_stft_squeezed = output_stft[i]  # [n_fft//2 + 1, time_frames, 2]
+                output_stft_complex = torch.view_as_complex(output_stft_squeezed)
+                output_audio_item = torch.istft(
+                    output_stft_complex,
+                    n_fft=self.n_fft,
+                    hop_length=self.hop_length,
+                    win_length=self.n_fft,
+                    window=torch.hann_window(self.n_fft, device=audio.device),
+                    center=True,
+                    normalized=False,
+                    onesided=True
+                )
+                audio_results.append(output_audio_item)
+            output_audio = torch.stack(audio_results, dim=0)  # [batch, time]
+        
+        return output_audio
 
